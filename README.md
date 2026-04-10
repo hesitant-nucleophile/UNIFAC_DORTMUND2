@@ -10,7 +10,7 @@ T=298
 
 system=Unifac_Dortmund(smiles_lst,mol_frac_lst,T)
 
-# gives activity coefficient of all components in the mixture
+# Returns activity coefficient of all components in the mixture according to the order in which componenets were passed
 system.gamma_total()
-# gives activity coefficient of component i in the mixture, according to the  order in which the components were passed.
+# Returns activity coefficient of component i in the mixture, according to the  order in which the components were passed.
 system.gamma_singular(i)
