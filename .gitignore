@@ -1,0 +1,9 @@
+# Ignore everything
+*
+# Un-ignore specific files
+!.gitignore
+!__init__.py
+!groupe_surfaces_and_volumes.xlsx
+!interaction_parameters.xlsx
+!unifac_dortmund.py
+

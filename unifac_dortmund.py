@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
-from rdkit import Chem
+#from rdkit import Chem
 from ugropy import Groups
+from scipy.optimize import minimize
 import os
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,17 +17,28 @@ df_sv=pd.read_excel(file_path2)
 
 
 class Unifac_Dortmund:
+    _group_cache = {}  # class-level cache shared across all instances, keyed by smiles tuple
+
     def __init__(self,smiles_lst,mol_lst,T):
         self.smiles_lst=smiles_lst
         self.mol_lst=mol_lst
         self.T=T
-        self.list_groups, self.unique_group_no = self.format_data()
+
+        # making sure here to store the disected groups because of the stability analysis calls it repeatedly
+        # but doesent actually change the groups between instances
+        cache_key = tuple(smiles_lst)
+        if cache_key in Unifac_Dortmund._group_cache: # this is used the rest of the time
+            self.list_groups, self.unique_group_no = Unifac_Dortmund._group_cache[cache_key]
+        else:
+            self.list_groups, self.unique_group_no = self.format_data() # this is used for the very first instances 
+            Unifac_Dortmund._group_cache[cache_key] = (self.list_groups, self.unique_group_no)
 
         # error messages
         if len(mol_lst) != len(smiles_lst):
             raise ValueError(f"phi_lst (len={len(mol_lst)}) and smiles_lst (len={len(smiles_lst)}) must have same length.")
         
-        if sum(mol_lst)!=1:
+        
+        if not np.isclose(sum(mol_lst), 1.0, atol=1e-6):
             raise ValueError(f"molefractions must sum to unity, but where of sum {sum(mol_lst)}")
     
     # smiles to groupes
@@ -214,8 +226,9 @@ class Unifac_Dortmund:
                         Amk,Bmk,Cmk=df_ip.loc[index,"Aij"],df_ip.loc[index,"Bij"],df_ip.loc[index,"Cij"]
                         Akm,Bkm,Ckm=df_ip.loc[index,"Aji"],df_ip.loc[index,"Bji"],df_ip.loc[index,"Cji"]
                 except:
-                    print(f"Interaction parameters not found for groups {mg1} and {mg2}")
-                    return None
+                    raise Exception(f"Interaction parameters not found for groups {mg1} and {mg2}") from None
+                    #print(f"Interaction parameters not found for groups {mg1} and {mg2}")
+                    #return None
                 a_mk=Amk+Bmk*T+Cmk*T**2
                 a_km=Akm+Bkm*T+Ckm*T**2
             cap_psi_mk=np.exp(-a_mk/T)
@@ -247,8 +260,9 @@ class Unifac_Dortmund:
                             Anm,Bnm,Cnm=df_ip.loc[index,"Aji"],df_ip.loc[index,"Bji"],df_ip.loc[index,"Cji"]
                             
                     except:
-                        print(f"Interaction parameters not found for groups {mg2} and {mg3}")
-                        return None
+                        raise Exception(f"Interaction parameters not found for groups {mg2} and {mg3}") from None
+                        #print(f"Interaction parameters not found for groups {mg2} and {mg3}")
+                        #return None
                     a_nm=Anm+Bnm*T+Cnm*T**2
                 cap_psi_nm=np.exp(-a_nm/(T))
                 
@@ -296,8 +310,9 @@ class Unifac_Dortmund:
                         Amk,Bmk,Cmk=df_ip.loc[index,"Aij"],df_ip.loc[index,"Bij"],df_ip.loc[index,"Cij"]
                         Akm,Bkm,Ckm=df_ip.loc[index,"Aji"],df_ip.loc[index,"Bji"],df_ip.loc[index,"Cji"]
                 except:
-                    print(f"Interaction parameters not found for groups {mg1} and {mg2}")
-                    return None
+                    raise Exception(f"Interaction parameters not found for groups {mg1} and {mg2}") from None
+                    #print(f"Interaction parameters not found for groups {mg1} and {mg2}")
+                    #return None
                 a_mk=Amk+Bmk*T+Cmk*T**2
                 a_km=Akm+Bkm*T+Ckm*T**2
             cap_psi_mk=np.exp(-a_mk/T)
@@ -327,8 +342,9 @@ class Unifac_Dortmund:
                             index=df_ip.index[(df_ip["i"] == mg2) & (df_ip["j"] == mg3)][0]
                             Anm,Bnm,Cnm=df_ip.loc[index,"Aji"],df_ip.loc[index,"Bji"],df_ip.loc[index,"Cji"]
                     except:
-                        print(f"Interaction parameters not found for groups {mg2} and {mg3}")
-                        return None
+                        raise Exception(f"Interaction parameters not found for groups {mg2} and {mg3}") from None
+                        #print(f"Interaction parameters not found for groups {mg2} and {mg3}")
+                        #return None
                     a_nm=Anm+Bnm*T+Cnm*T**2
                 cap_psi_nm=np.exp(-a_nm/(T))
                 
@@ -497,7 +513,136 @@ class Unifac_Dortmund:
         return lst
 
 
+    #=================================stability analysis=================================
+    def constrained_hessian(self):
+        h = 1e-5
+        R_gas = 8.314
+        N = len(self.mol_lst)
+        T = self.T
+        smiles_lst = self.smiles_lst
+        x_reduced0 = np.array(self.mol_lst[:-1])  # N-1 independent variables
 
+        def x_from_reduced(xr):
+            xN = 1.0 - np.sum(xr)
+            return np.concatenate([xr, [xN]])
+
+        def G_mix(xr):
+            x_vec = x_from_reduced(xr)
+            temp = Unifac_Dortmund(smiles_lst, list(x_vec), T)
+            gamma = np.array(temp.gamma_total())
+
+            ideal = R_gas * T * np.sum(x_vec * np.log(np.maximum(x_vec, 1e-300)))
+            excess = R_gas * T * np.sum(x_vec * np.log(gamma))
+            return ideal + excess
+
+        Nr = N - 1
+        H = np.zeros((Nr, Nr))
+        g0 = G_mix(x_reduced0)
+
+        for i in range(Nr):
+            xf = x_reduced0.copy(); xf[i] += h
+            xb = x_reduced0.copy(); xb[i] -= h
+            H[i, i] = (G_mix(xf) - 2*g0 + G_mix(xb)) / h**2
+
+            for j in range(i+1, Nr):
+                xpp = x_reduced0.copy(); xpp[i] += h; xpp[j] += h
+                xpm = x_reduced0.copy(); xpm[i] += h; xpm[j] -= h
+                xmp = x_reduced0.copy(); xmp[i] -= h; xmp[j] += h
+                xmm = x_reduced0.copy(); xmm[i] -= h; xmm[j] -= h
+                H[i, j] = (G_mix(xpp) - G_mix(xpm) - G_mix(xmp) + G_mix(xmm)) / (4*h**2)
+                H[j, i] = H[i, j]
+
+        return H
+
+    def is_stable_local(self):
+        hessian_m = self.constrained_hessian()
+        try:
+            np.linalg.cholesky(hessian_m)  # checking for all eigenvalues positive
+            return True
+        except np.linalg.LinAlgError:
+            return False
+
+    def tpd(self, w):
+        w = np.array(w) * 1 / sum(w)  # normalized molefraction
+        N = len(self.mol_lst)
+        z = self.mol_lst
+        gamma_z = np.array(self.gamma_total())  # gamma at feed composition
+        gamma_w = Unifac_Dortmund(self.smiles_lst, list(w), self.T).gamma_total()
+
+        sum_i = 0
+        for i in range(N):
+            w_i = w[i]
+            z_i = z[i]
+            sum_i += w_i * (np.log(w_i * gamma_w[i]) - np.log(z_i * gamma_z[i]))
+        return sum_i
+
+    def is_stable_global(self):
+        ss_iters = 10
+        N = len(self.mol_lst)
+        T = self.T
+        smiles_lst = self.smiles_lst
+        z = np.array(self.mol_lst)
+        gamma_z = np.array(self.gamma_total())
+        a = z * gamma_z  # feed activities
+
+        def magnussen_guess():
+            if a.max() > 1:
+                return None, None
+
+            candidates, F_values = [], []
+
+            for j in range(N):
+                # infinite-dilution-like gammas: composition ~pure in component j
+                x_pure = np.full(N, 1e-6)
+                x_pure[j] = 1 - 1e-6 * (N - 1)
+                gamma_inf_j = np.array(Unifac_Dortmund(smiles_lst, list(x_pure), T).gamma_total())
+
+                x = a / gamma_inf_j
+                x = x / x.sum()
+
+                for _ in range(ss_iters):
+                    gamma_i = np.array(Unifac_Dortmund(smiles_lst, list(x), T).gamma_total())
+                    x = a / gamma_i
+                    x = x / x.sum()
+
+                gamma_i = np.array(Unifac_Dortmund(smiles_lst, list(x), T).gamma_total())
+                S_j = np.sum(x * (np.log(x * gamma_i) - np.log(a)))
+                G_j = np.sum((x - z) * (np.log(x * gamma_i) - np.log(a)))
+                F_j = S_j if S_j < 0 else S_j - 0.5 * G_j
+
+                candidates.append(x)
+                F_values.append(F_j)
+
+            j_star = int(np.argmin(F_values))
+            return candidates[j_star], candidates
+
+        best_guess, all_guesses = magnussen_guess()
+        if best_guess is None:
+            print("a_max > 1 -> unstable by Magnussen shortcut")
+            return False
+
+        # unconstrained reparametrization: u = ln(w), normalized inside f
+        def tpd_u(u):
+            w = np.exp(u)
+            w = w / w.sum()
+            return self.tpd(w)
+
+        best = None
+        for x0 in all_guesses:  # multistart over all N Magnussen trial phases
+            u0 = np.log(np.clip(x0, 1e-10, None))
+            res = minimize(tpd_u, u0, method='BFGS',
+                            options={'gtol': 1e-8, 'maxiter': 200})
+            if best is None or res.fun < best:
+                best = res.fun
+
+        print(f"min TPD={round(best,5)}")
+        return bool(round(best, 8) >= 0)
+
+    def is_stable(self):
+        if self.is_stable_local():
+            return self.is_stable_global()
+        else:
+            return False
 
 
 
